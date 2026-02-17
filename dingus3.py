@@ -12,7 +12,8 @@ import whisper
 # MODEL = 'qwen3:4b'
 # MODEL = 'phi3.5'
 # MODEL = 'ministral-3:3b'
-MODEL = 'llama3.2:3b'
+# MODEL = 'llama3.2:3b'
+MODEL = 'qwen2:0.5b'
 
 # Download language model if it isn't already
 ollama.pull(MODEL)
@@ -24,8 +25,8 @@ Respond with one or a few sentences with no output styling. Only if you are aske
 
 VOICEDIR = Path('voices')
 
-VOICE = 'kokoro-v0_19'
-# VOICE = 'en_US-lessac-medium'
+# VOICE = 'kokoro-v0_19'
+VOICE = 'en_US-lessac-medium'
 # VOICE = 'en_US-lj-medium'
 # VOICE = 'en_US-mv2-medium'
 # VOICE = 'en_UK-cori-high'
@@ -43,11 +44,13 @@ stt = whisper.load_model("small")
 TRIGGER_WORD = 'avocado'
 
 # set up wakeword detection
-rec = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
-# rec = auditok.Recorder(None, sr=16000, sw=2, ch=1)
+# rec = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
+# rec = auditok.Recorder(None, sr=16000, sw=2, ch=1, max_read=600)
+source = None # microphone
 
 # wait for detected audio
-for region in auditok.split(rec, min_dur=1, max_silence=2, max_dur=100, eth=55):
+for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
+    print('power threshold')
     region.save('region.wav')
     transcribed = stt.transcribe('region.wav', language='en', fp16=False)['text']
 
@@ -60,10 +63,12 @@ for region in auditok.split(rec, min_dur=1, max_silence=2, max_dur=100, eth=55):
         continue
 
     # strip out the trigger word
+    print('  transcribing...')
     transcribed = transcribed.split(TRIGGER_WORD, 1)[1]
 
     print('<<<', transcribed)
 
+    print('  responding...')
     response = ollama.generate(
         model=MODEL,
         system=SYSTEM,
