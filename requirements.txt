@@ -1,0 +1,6 @@
+auditok
+torch --index-url https://download.pytorch.org/whl/cpu
+torchaudio --index-url https://download.pytorch.org/whl/cpu
+ollama
+piper-tts
+openai-whisper
