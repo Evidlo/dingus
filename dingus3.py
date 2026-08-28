@@ -134,9 +134,11 @@ RECORDINGS.mkdir(parents=True, exist_ok=True)
 LAST_VOICE = 'last_voice.wav'
 LAST_TRIGGER = 'last_voice_trigger.wav'
 
-# audio captured while the assistant was talking is its own response coming
-# back -- over a repeater it returns cleanly enough to transcribe -- so ignore
-# everything until playback has finished and the buffer has drained
+# audio captured while the assistant is talking is its own response coming
+# back -- over a repeater it returns cleanly enough to transcribe.  Waiting out
+# the buffer afterwards is not enough for a long response, so mute the capture
+# device for the duration and give the tail time to pass before unmuting.
+MIC = '@DEFAULT_SOURCE@'
 PLAYBACK_TAIL = 2
 
 # the 440/880 pair acknowledges the trigger word so the speaker knows it was heard;
@@ -147,6 +149,9 @@ VOX_TONE = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1'
 # set up wakeword detection
 # rec = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
 source = None # microphone
+
+# a crash during playback would otherwise leave the microphone muted
+run(f'pactl set-source-mute {MIC} 0', shell=True)
 
 # wall clock time until which captured audio is discarded
 deaf_until = 0
@@ -213,6 +218,11 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
     with wave.open('response.wav', 'wb') as wav_file:
         tts.synthesize_wav(response, wav_file)
 
+    run(f'pactl set-source-mute {MIC} 1', shell=True)
     run(VOX_TONE, shell=True)
     run('aplay -q response.wav', shell=True)
+    time.sleep(PLAYBACK_TAIL)
+    run(f'pactl set-source-mute {MIC} 0', shell=True)
+
+    # whatever auditok buffered before the mute took effect
     deaf_until = time.time() + PLAYBACK_TAIL
