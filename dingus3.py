@@ -4,6 +4,7 @@ import auditok
 import ollama
 import queue
 import requests
+import shutil
 import threading
 import time
 import urllib.parse
@@ -104,6 +105,11 @@ TRIGGER_WORDS = ('avocado', 'avocato')
 RECORDINGS = Path('recordings')
 RECORDINGS.mkdir(parents=True, exist_ok=True)
 
+# fixed paths to the newest of each, so the most recent audio can be grabbed
+# without looking up a timestamp
+LAST_VOICE = 'last_voice.wav'
+LAST_TRIGGER = 'last_voice_trigger.wav'
+
 # the 440/880 pair acknowledges the trigger word so the speaker knows it was heard;
 # the 440 alone leads each response, giving VOX time to key up before speech starts
 ACK_TONES = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1 : synth sin 880 fade h 0.1 .2 0.1'
@@ -118,6 +124,7 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
     stamp = time.strftime('%Y%m%d-%H%M%S')
     activity = str(RECORDINGS / f'activity_{stamp}.wav')
     region.save(activity)
+    shutil.copy(activity, LAST_VOICE)
     # vad_filter runs Silero first, which drops repeater Morse and other non-speech
     segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=True)
     transcribed = ' '.join(segment.text for segment in segments).strip()
@@ -134,7 +141,9 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
     if trigger is None:
         continue
 
-    region.save(str(RECORDINGS / f'trigger_{stamp}.wav'))
+    triggered = str(RECORDINGS / f'trigger_{stamp}.wav')
+    region.save(triggered)
+    shutil.copy(triggered, LAST_TRIGGER)
 
     # acknowledge the trigger word
     run(ACK_TONES, shell=True)
