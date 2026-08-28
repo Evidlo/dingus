@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import auditok
+import numpy as np
 import ollama
 import queue
 import requests
@@ -12,6 +13,7 @@ import wave
 from faster_whisper import WhisperModel
 from pathlib import Path
 from piper import PiperVoice, download_voices
+from silero_vad import load_silero_vad, get_speech_timestamps
 from subprocess import run
 
 # --- language model setup ---
@@ -50,6 +52,28 @@ tts = PiperVoice.load(path)
 STT_MODEL = 'distil-small.en'
 
 stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
+
+# --- voice activity detection ---
+
+vad = load_silero_vad()
+
+# silero is recurrent, and a full-scale transient (a tongue click, a squelch
+# burst) poisons its state for the remainder of a call, hiding speech that
+# follows.  Check short chunks with the state reset between them instead.
+VAD_CHUNK = 2 * 16000
+
+
+def has_speech(region):
+    """True when any chunk of the region contains speech."""
+    samples = region.numpy()[0] / 32768
+    for start in range(0, samples.size, VAD_CHUNK):
+        chunk = samples[start:start + VAD_CHUNK]
+        vad.reset_states()
+        if chunk.size > 4000 and get_speech_timestamps(chunk, vad, sampling_rate=16000):
+            return True
+
+    return False
+
 
 # --- transcript mirroring ---
 
@@ -121,12 +145,18 @@ source = None # microphone
 
 # wait for detected audio
 for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
+    # auditok only chunks on energy, so silence and repeater tones reach here;
+    # silero decides what is speech, and nothing else is written to disk
+    if not has_speech(region):
+        continue
+
     stamp = time.strftime('%Y%m%d-%H%M%S')
     activity = str(RECORDINGS / f'activity_{stamp}.wav')
     region.save(activity)
     shutil.copy(activity, LAST_VOICE)
-    # vad_filter runs Silero first, which drops repeater Morse and other non-speech
-    segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=True)
+    # vad_filter would re-run silero over the whole region and blank exactly the
+    # transient-preceded speech has_speech() recovers, so leave it off
+    segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=False)
     transcribed = ' '.join(segment.text for segment in segments).strip()
 
     # attempt to filter out noise recognized erroneously as short phrases

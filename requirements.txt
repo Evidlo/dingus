@@ -1,5 +1,7 @@
 auditok
 faster-whisper
+numpy
+silero-vad
 ollama
 piper-tts
 requests
