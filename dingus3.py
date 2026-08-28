@@ -134,6 +134,11 @@ RECORDINGS.mkdir(parents=True, exist_ok=True)
 LAST_VOICE = 'last_voice.wav'
 LAST_TRIGGER = 'last_voice_trigger.wav'
 
+# audio captured while the assistant was talking is its own response coming
+# back -- over a repeater it returns cleanly enough to transcribe -- so ignore
+# everything until playback has finished and the buffer has drained
+PLAYBACK_TAIL = 2
+
 # the 440/880 pair acknowledges the trigger word so the speaker knows it was heard;
 # the 440 alone leads each response, giving VOX time to key up before speech starts
 ACK_TONES = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1 : synth sin 880 fade h 0.1 .2 0.1'
@@ -143,8 +148,15 @@ VOX_TONE = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1'
 # rec = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
 source = None # microphone
 
+# wall clock time until which captured audio is discarded
+deaf_until = 0
+
 # wait for detected audio
 for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
+    # auditok buffers whatever arrived while this loop was busy speaking
+    if time.time() < deaf_until:
+        continue
+
     # auditok only chunks on energy, so silence and repeater tones reach here;
     # silero decides what is speech, and nothing else is written to disk
     if not has_speech(region):
@@ -203,3 +215,4 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
 
     run(VOX_TONE, shell=True)
     run('aplay -q response.wav', shell=True)
+    deaf_until = time.time() + PLAYBACK_TAIL
