@@ -13,3 +13,4 @@ __pycache__/
 matrix_token
 *.token
 .env
+recordings/

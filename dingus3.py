@@ -99,9 +99,10 @@ print(f'matrix posting to {MATRIX_ROOM}:', bool(token))
 # distil-small.en hears "avocado" as "avocato" often enough to accept both
 TRIGGER_WORDS = ('avocado', 'avocato')
 
-# the most recent detected speech, and the most recent that carried a trigger word
-VOICE_FILE = 'last_voice.wav'
-TRIGGER_FILE = 'last_voice_trigger.wav'
+# every detected region is kept for debugging and tuning; regions carrying a
+# trigger word are saved a second time under the same timestamp
+RECORDINGS = Path('recordings')
+RECORDINGS.mkdir(parents=True, exist_ok=True)
 
 # the 440/880 pair acknowledges the trigger word so the speaker knows it was heard;
 # the 440 alone leads each response, giving VOX time to key up before speech starts
@@ -114,9 +115,11 @@ source = None # microphone
 
 # wait for detected audio
 for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
-    region.save(VOICE_FILE)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    activity = str(RECORDINGS / f'activity_{stamp}.wav')
+    region.save(activity)
     # vad_filter runs Silero first, which drops repeater Morse and other non-speech
-    segments, _ = stt.transcribe(VOICE_FILE, language='en', beam_size=1, vad_filter=True)
+    segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=True)
     transcribed = ' '.join(segment.text for segment in segments).strip()
 
     # attempt to filter out noise recognized erroneously as short phrases
@@ -131,7 +134,7 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
     if trigger is None:
         continue
 
-    region.save(TRIGGER_FILE)
+    region.save(str(RECORDINGS / f'trigger_{stamp}.wav'))
 
     # acknowledge the trigger word
     run(ACK_TONES, shell=True)
