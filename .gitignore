@@ -1,4 +1,5 @@
 data/
+voices/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -7,3 +8,8 @@ __pycache__/
 *wav
 *onnx
 *onnx.json
+
+# secrets
+matrix_token
+*.token
+.env
