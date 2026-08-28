@@ -45,8 +45,10 @@ tts = PiperVoice.load(path)
 
 # --- STT model setup ---
 
-# STT_MODEL = 'small'
-STT_MODEL = 'distil-small.en'
+# distil-small.en is ~1.4x faster but hears the trigger word as "Avocato",
+# so the wakeword never matches
+# STT_MODEL = 'distil-small.en'
+STT_MODEL = 'small'
 
 stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 
