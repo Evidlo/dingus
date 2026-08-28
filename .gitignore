@@ -14,3 +14,6 @@ matrix_token
 *.token
 .env
 recordings/
+
+# labelled dataset is kept despite the *wav rule above
+!samples/*.wav
