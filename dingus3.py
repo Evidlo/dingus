@@ -45,10 +45,8 @@ tts = PiperVoice.load(path)
 
 # --- STT model setup ---
 
-# distil-small.en is ~1.4x faster but hears the trigger word as "Avocato",
-# so the wakeword never matches
-# STT_MODEL = 'distil-small.en'
-STT_MODEL = 'small'
+# STT_MODEL = 'small'
+STT_MODEL = 'distil-small.en'
 
 stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 
@@ -97,8 +95,13 @@ def mirror(line):
 
 print(f'matrix posting to {MATRIX_ROOM}:', bool(token))
 
-# audio must contain this word to trigger response
-TRIGGER_WORD = 'avocado'
+# audio must contain one of these words to trigger a response;
+# distil-small.en hears "avocado" as "avocato" often enough to accept both
+TRIGGER_WORDS = ('avocado', 'avocato')
+
+# the most recent detected speech, and the most recent that carried a trigger word
+VOICE_FILE = 'last_voice.wav'
+TRIGGER_FILE = 'last_voice_trigger.wav'
 
 # the 440/880 pair acknowledges the trigger word so the speaker knows it was heard;
 # the 440 alone leads each response, giving VOX time to key up before speech starts
@@ -111,9 +114,9 @@ source = None # microphone
 
 # wait for detected audio
 for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
-    region.save('region.wav')
+    region.save(VOICE_FILE)
     # vad_filter runs Silero first, which drops repeater Morse and other non-speech
-    segments, _ = stt.transcribe('region.wav', language='en', beam_size=1, vad_filter=True)
+    segments, _ = stt.transcribe(VOICE_FILE, language='en', beam_size=1, vad_filter=True)
     transcribed = ' '.join(segment.text for segment in segments).strip()
 
     # attempt to filter out noise recognized erroneously as short phrases
@@ -124,14 +127,17 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
 
     # whisper capitalizes sentence-initial words, so match the trigger case insensitively
     spoken = transcribed.lower()
-    if TRIGGER_WORD not in spoken:
+    trigger = next((word for word in TRIGGER_WORDS if word in spoken), None)
+    if trigger is None:
         continue
+
+    region.save(TRIGGER_FILE)
 
     # acknowledge the trigger word
     run(ACK_TONES, shell=True)
 
     # strip out the trigger word and everything before it
-    prompt = transcribed[spoken.index(TRIGGER_WORD) + len(TRIGGER_WORD):].lstrip(' ,.')
+    prompt = transcribed[spoken.index(trigger) + len(trigger):].lstrip(' ,.')
 
     response = ollama.generate(
         model=MODEL,
