@@ -12,6 +12,7 @@ import urllib.parse
 import wave
 from faster_whisper import WhisperModel
 from pathlib import Path
+from auditok.util import DataValidator
 from piper import PiperVoice, download_voices
 from silero_vad import load_silero_vad, get_speech_timestamps
 from subprocess import run
@@ -55,24 +56,20 @@ stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 
 # --- voice activity detection ---
 
+# a silero validator, not raw energy, decides which windows auditok keeps as speech
 vad = load_silero_vad()
 
-# silero is recurrent, and a full-scale transient (a tongue click, a squelch
-# burst) poisons its state for the remainder of a call, hiding speech that
-# follows.  Check short chunks with the state reset between them instead.
-VAD_CHUNK = 2 * 16000
+# a lone window has little context, so drop the threshold; junk is filtered downstream
+VAD_THRESHOLD = 0.1
 
 
-def has_speech(region):
-    """True when any chunk of the region contains speech."""
-    samples = region.numpy()[0] / 32768
-    for start in range(0, samples.size, VAD_CHUNK):
-        chunk = samples[start:start + VAD_CHUNK]
+class SileroValidator(DataValidator):
+    # reset per window so a transient can't poison silero's recurrent state
+    def is_valid(self, data):
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768
         vad.reset_states()
-        if chunk.size > 4000 and get_speech_timestamps(chunk, vad, sampling_rate=16000):
-            return True
-
-    return False
+        return bool(get_speech_timestamps(samples, vad, sampling_rate=16000,
+                                          threshold=VAD_THRESHOLD))
 
 
 # --- transcript mirroring ---
@@ -107,8 +104,8 @@ def post_to_matrix():
 threading.Thread(target=post_to_matrix, daemon=True).start()
 
 
-def mirror(line):
-    """Send one transcript line to the console, the log file and the Matrix room."""
+def log_matrix(line):
+    """Log activity and responses to console and matrix"""
     print(line, flush=True)
     with LOGFILE.open('a') as log:
         log.write(line + '\n')
@@ -153,26 +150,25 @@ source = None # microphone
 # a crash during playback would otherwise leave the microphone muted
 run(f'pactl set-source-mute {MIC} 0', shell=True)
 
-# wall clock time until which captured audio is discarded
-deaf_until = 0
+# mute while responding to handle audio loopback issue
+mute_until = 0
 
-# wait for detected audio
-for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence=2, max_dur=100, eth=55):
-    # auditok buffers whatever arrived while this loop was busy speaking
-    if time.time() < deaf_until:
-        continue
-
-    # auditok only chunks on energy, so silence and repeater tones reach here;
-    # silero decides what is speech, and nothing else is written to disk
-    if not has_speech(region):
+# wait for detected voice activity
+regions = auditok.split(
+    source, sw=2, ch=1, sr=16000, aw=0.5,
+    min_dur=1, max_silence=2, max_dur=100,
+    validator=SileroValidator()
+)
+for region in regions:
+    # mute while responding to handle audio loopback issue
+    if time.time() < mute_until:
         continue
 
     stamp = time.strftime('%Y%m%d-%H%M%S')
     activity = str(RECORDINGS / f'activity_{stamp}.wav')
     region.save(activity)
     shutil.copy(activity, LAST_VOICE)
-    # vad_filter would re-run silero over the whole region and blank exactly the
-    # transient-preceded speech has_speech() recovers, so leave it off
+    # leave vad_filter off: it would blank the transient-preceded speech the validator recovers
     segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=False)
     transcribed = ' '.join(segment.text for segment in segments).strip()
 
@@ -182,7 +178,7 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
 
     mirror(f'< {transcribed}')
 
-    # whisper capitalizes sentence-initial words, so match the trigger case insensitively
+    # wait for a trigger word
     spoken = transcribed.lower()
     trigger = next((word for word in TRIGGER_WORDS if word in spoken), None)
     if trigger is None:
@@ -224,5 +220,5 @@ for region in auditok.split(source, sw=2, ch=1, sr=16000, min_dur=1, max_silence
     time.sleep(PLAYBACK_TAIL)
     run(f'pactl set-source-mute {MIC} 0', shell=True)
 
-    # whatever auditok buffered before the mute took effect
-    deaf_until = time.time() + PLAYBACK_TAIL
+    # mute while responding to handle audio loopback issue
+    mute_until = time.time() + PLAYBACK_TAIL
