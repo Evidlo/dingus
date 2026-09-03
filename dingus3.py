@@ -3,19 +3,27 @@
 import auditok
 import numpy as np
 import ollama
-import queue
 import requests
 import shutil
-import threading
 import time
 import urllib.parse
 import wave
+from auditok.util import DataValidator
+from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
 from pathlib import Path
-from auditok.util import DataValidator
 from piper import PiperVoice, download_voices
 from silero_vad import load_silero_vad, get_speech_timestamps
 from subprocess import run
+
+
+# --- background workers ---
+
+def worker(fn):
+    """Decorate fn to run on its own serial background thread; calls return at once."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    return lambda *a, **k: pool.submit(fn, *a, **k)
+
 
 # --- language model setup ---
 
@@ -59,17 +67,14 @@ stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 # a silero validator, not raw energy, decides which windows auditok keeps as speech
 vad = load_silero_vad()
 
-# a lone window has little context, so drop the threshold; junk is filtered downstream
-VAD_THRESHOLD = 0.1
-
-
 class SileroValidator(DataValidator):
     # reset per window so a transient can't poison silero's recurrent state
     def is_valid(self, data):
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768
         vad.reset_states()
-        return bool(get_speech_timestamps(samples, vad, sampling_rate=16000,
-                                          threshold=VAD_THRESHOLD))
+        return bool(get_speech_timestamps(
+            samples, vad, sampling_rate=16000, threshold=0.1
+        ))
 
 
 # --- transcript mirroring ---
@@ -82,37 +87,32 @@ MATRIX_TOKEN = Path('~/.local/matrix_token').expanduser()
 
 token = MATRIX_TOKEN.read_text().strip() if MATRIX_TOKEN.exists() else ''
 room = urllib.parse.quote(MATRIX_ROOM, safe='')
-outbox = queue.Queue()
 
 
-def post_to_matrix():
-    """Drain the outbox so a slow homeserver never stalls recognition."""
-    while True:
-        line = outbox.get()
-        try:
-            posted = requests.put(
-                f'{MATRIX_API}/rooms/{room}/send/m.room.message/{time.time_ns()}',
-                headers={'Authorization': f'Bearer {token}'},
-                json={'msgtype': 'm.text', 'body': line},
-                timeout=10,
-            )
-            posted.raise_for_status()
-        except Exception as e:
-            print('matrix send failed:', e)
+@worker
+def post_to_matrix(line):
+    """Send one line to Matrix off-thread so a slow homeserver never stalls recognition."""
+    try:
+        posted = requests.put(
+            f'{MATRIX_API}/rooms/{room}/send/m.room.message/{time.time_ns()}',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'msgtype': 'm.text', 'body': line},
+            timeout=10,
+        )
+        posted.raise_for_status()
+    except Exception as e:
+        print('matrix send failed:', e)
 
 
-threading.Thread(target=post_to_matrix, daemon=True).start()
-
-
-def log_matrix(line):
-    """Log activity and responses to console and matrix"""
+def mirror(line):
+    """Send one transcript line to the console, the log file and the Matrix room."""
     print(line, flush=True)
     with LOGFILE.open('a') as log:
         log.write(line + '\n')
 
     # posting stays disabled until an access token is installed
     if token:
-        outbox.put(line)
+        post_to_matrix(line)
 
 
 print(f'matrix posting to {MATRIX_ROOM}:', bool(token))
@@ -131,10 +131,7 @@ RECORDINGS.mkdir(parents=True, exist_ok=True)
 LAST_VOICE = 'last_voice.wav'
 LAST_TRIGGER = 'last_voice_trigger.wav'
 
-# audio captured while the assistant is talking is its own response coming
-# back -- over a repeater it returns cleanly enough to transcribe.  Waiting out
-# the buffer afterwards is not enough for a long response, so mute the capture
-# device for the duration and give the tail time to pass before unmuting.
+# the assistant's own speech returns over the repeater; mute capture during playback, discard the tail after
 MIC = '@DEFAULT_SOURCE@'
 PLAYBACK_TAIL = 2
 
@@ -143,61 +140,65 @@ PLAYBACK_TAIL = 2
 ACK_TONES = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1 : synth sin 880 fade h 0.1 .2 0.1'
 VOX_TONE = 'play -n -c1 synth sin 440 fade h 0.1 .4 .1'
 
-# set up wakeword detection
-# rec = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
+# audio source
+# source = auditok.Recorder(input='input_double.wav', sr=16000, sw=2, ch=1)
 source = None # microphone
 
 # a crash during playback would otherwise leave the microphone muted
 run(f'pactl set-source-mute {MIC} 0', shell=True)
 
-# mute while responding to handle audio loopback issue
+# capture skips, and respond drops, anything from before this wall-clock time
 mute_until = 0
 
-# wait for detected voice activity
-regions = auditok.split(
-    source, sw=2, ch=1, sr=16000, aw=0.5,
-    min_dur=1, max_silence=2, max_dur=100,
-    validator=SileroValidator()
-)
-for region in regions:
-    # mute while responding to handle audio loopback issue
-    if time.time() < mute_until:
-        continue
 
-    stamp = time.strftime('%Y%m%d-%H%M%S')
-    activity = str(RECORDINGS / f'activity_{stamp}.wav')
-    region.save(activity)
-    shutil.copy(activity, LAST_VOICE)
+@worker
+def transcribe(region, captured_at):
+    """Transcribe one region and, when it carries the trigger word, answer it."""
+    global mute_until
+    # drop what was buffered during the last exchange (the assistant's own echo)
+    if captured_at < mute_until:
+        return
+
+    stamp = time.strftime('%Y%m%d-%H%M%S', time.localtime(captured_at))
     # leave vad_filter off: it would blank the transient-preceded speech the validator recovers
-    segments, _ = stt.transcribe(activity, language='en', beam_size=1, vad_filter=False)
+    segments, _ = stt.transcribe(
+        (region.samples[0] / 32768).astype(np.float32),
+        language='en', beam_size=1, vad_filter=False
+    )
     transcribed = ' '.join(segment.text for segment in segments).strip()
 
-    # attempt to filter out noise recognized erroneously as short phrases
+    # drop noise misrecognized as a short phrase
     if len(transcribed.split(' ')) < 3:
-        continue
+        return
 
     mirror(f'< {transcribed}')
 
-    # wait for a trigger word
-    spoken = transcribed.lower()
-    trigger = next((word for word in TRIGGER_WORDS if word in spoken), None)
-    if trigger is None:
-        continue
+    for trigger in TRIGGER_WORDS:
+        # trigger word detected
+        if trigger in transcribed.lower():
+            # save triggered audio
+            region.save(path:=str(RECORDINGS / f'trigger_{stamp}.wav'))
+            shutil.copy(path, LAST_TRIGGER)
+            # strip the trigger word and everything before it
+            respond(transcribed[transcribed.index(trigger) + len(trigger):].lstrip(' ,.'))
+            break
 
-    triggered = str(RECORDINGS / f'trigger_{stamp}.wav')
-    region.save(triggered)
-    shutil.copy(triggered, LAST_TRIGGER)
+    # save audio
+    region.save(path:=str(RECORDINGS / f'activity_{stamp}.wav'))
+    shutil.copy(path, LAST_VOICE)
 
-    # acknowledge the trigger word
-    run(ACK_TONES, shell=True)
 
-    # strip out the trigger word and everything before it
-    prompt = transcribed[spoken.index(trigger) + len(trigger):].lstrip(' ,.')
+@worker
+def respond(transcribed):
+    global mute_until
+
+    run(ACK_TONES, shell=True)  # acknowledge the trigger word
+
 
     response = ollama.generate(
         model=MODEL,
         system=SYSTEM,
-        prompt=prompt,
+        prompt=transcribed,
         think=False,
         stream=False,
         options={
@@ -220,5 +221,17 @@ for region in regions:
     time.sleep(PLAYBACK_TAIL)
     run(f'pactl set-source-mute {MIC} 0', shell=True)
 
-    # mute while responding to handle audio loopback issue
+    # mute input while responding
     mute_until = time.time() + PLAYBACK_TAIL
+
+
+# detect voice activity blocks
+regions = auditok.split(
+    source, sw=2, ch=1, sr=16000, aw=0.5,
+    min_dur=1, max_silence=2, max_dur=100,
+    validator=SileroValidator()
+)
+for region in regions:
+    if time.time() < mute_until:
+        continue
+    transcribe(region, time.time())
