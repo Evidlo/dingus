@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 
 import auditok
+import collections
 import numpy as np
 import ollama
 import requests
 import shutil
 import time
+import traceback
 import urllib.parse
 import wave
 from auditok.util import DataValidator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from faster_whisper import WhisperModel
 from pathlib import Path
 from piper import PiperVoice, download_voices
@@ -22,7 +25,14 @@ from subprocess import run
 def worker(fn):
     """Decorate fn to run on its own serial background thread; calls return at once."""
     pool = ThreadPoolExecutor(max_workers=1)
-    return lambda *a, **k: pool.submit(fn, *a, **k)
+
+    def log_exceptions(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            traceback.print_exc()
+
+    return lambda *args, **kwargs: pool.submit(log_exceptions, *args, **kwargs)
 
 
 # --- language model setup ---
@@ -31,14 +41,33 @@ def worker(fn):
 # MODEL = 'qwen3:4b'
 # MODEL = 'qwen2:0.5b'
 # MODEL = 'qwen3:1.7b'
-MODEL = 'qwen3.5:0.8b'
+# MODEL = 'qwen3.5:0.8b'
+# qwen2.5 (not 3.5) tool-calls directly, without a slow reasoning pass
+MODEL = 'qwen2.5:3b'
 
 # Download language model if it isn't already
 ollama.pull(MODEL)
 
 SYSTEM = 'You are a helpful assistant running on a HAM radio repeater giving short responses, \
 but willing to talk about any topic.  \
-Respond with one or a few sentences with no output styling. Only if you are asked, your callsign is KD9FMW.'
+Respond with one or a few sentences with no output styling. Only if you are asked, your callsign is KD9FMW.  \
+Use the provided tools for real-time facts such as the current time; never guess them.'
+
+# --- tools + conversation history ---
+
+def CurrentTime():
+    """Return the current local time of day."""
+    return datetime.now().strftime('%-I:%M %p')
+
+# name -> callable, and the matching schema handed to the model
+TOOLS = {'CurrentTime': CurrentTime}
+TOOL_SPECS = [{'type': 'function', 'function': {
+    'name': 'CurrentTime',
+    'description': 'Return the current local time of day.',
+    'parameters': {'type': 'object', 'properties': {}, 'required': []}}}]
+
+# last 10 messages of dialogue; appending past 10 evicts the oldest
+history = collections.deque(maxlen=10)
 
 # --- TTS model setup ---
 
@@ -68,12 +97,15 @@ stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 vad = load_silero_vad()
 
 class SileroValidator(DataValidator):
+    def __init__(self, threshold=0.1):
+        self.threshold = threshold
+
     # reset per window so a transient can't poison silero's recurrent state
     def is_valid(self, data):
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768
         vad.reset_states()
         return bool(get_speech_timestamps(
-            samples, vad, sampling_rate=16000, threshold=0.1
+            samples, vad, sampling_rate=16000, threshold=self.threshold
         ))
 
 
@@ -118,8 +150,8 @@ def mirror(line):
 print(f'matrix posting to {MATRIX_ROOM}:', bool(token))
 
 # audio must contain one of these words to trigger a response;
-# distil-small.en hears "avocado" as "avocato" often enough to accept both
-TRIGGER_WORDS = ('avocado', 'avocato')
+# whisper hears "avocado" as several near-spellings, so accept each
+TRIGGER_WORDS = ('avocado', 'avocato', 'avicado')
 
 # every detected region is kept for debugging and tuning; regions carrying a
 # trigger word are saved a second time under the same timestamp
@@ -128,8 +160,8 @@ RECORDINGS.mkdir(parents=True, exist_ok=True)
 
 # fixed paths to the newest of each, so the most recent audio can be grabbed
 # without looking up a timestamp
-LAST_VOICE = 'last_voice.wav'
-LAST_TRIGGER = 'last_voice_trigger.wav'
+LAST_ACTIVITY = 'last_activity.wav'
+LAST_TRIGGER = 'last_trigger.wav'
 
 # the assistant's own speech returns over the repeater; mute capture during playback, discard the tail after
 MIC = '@DEFAULT_SOURCE@'
@@ -180,35 +212,43 @@ def transcribe(region, captured_at):
             region.save(path:=str(RECORDINGS / f'trigger_{stamp}.wav'))
             shutil.copy(path, LAST_TRIGGER)
             # strip the trigger word and everything before it
-            respond(transcribed[transcribed.index(trigger) + len(trigger):].lstrip(' ,.'))
+            offset = transcribed.lower().index(trigger) + len(trigger)
+            respond(transcribed[offset:].lstrip(' ,.'))
             break
 
     # save audio
     region.save(path:=str(RECORDINGS / f'activity_{stamp}.wav'))
-    shutil.copy(path, LAST_VOICE)
+    shutil.copy(path, LAST_ACTIVITY)
 
 
 @worker
-def respond(transcribed):
+def respond(prompt):
     global mute_until
 
     run(ACK_TONES, shell=True)  # acknowledge the trigger word
 
+    history.append({'role': 'user', 'content': prompt})
+    messages = [{'role': 'system', 'content': SYSTEM}, *history]
 
-    response = ollama.generate(
-        model=MODEL,
-        system=SYSTEM,
-        prompt=transcribed,
-        think=False,
-        stream=False,
-        options={
-            # 'temperature': 0.9, # Higher for more creativity
-            # 'num_predict': 100, # Response length
-        },
-    )['response'].strip()
+    # temperature 0 keeps the tool-calling decision reliable
+    reply = ollama.chat(model=MODEL, messages=messages, tools=TOOL_SPECS,
+                        options={'temperature': 0}).message
+
+    # run any tool the model asked for, then ask again for the spoken answer
+    if reply.tool_calls:
+        messages.append(reply)
+        for tc in reply.tool_calls:
+            fn = TOOLS.get(tc.function.name)
+            result = fn(**tc.function.arguments) if fn else f'no such tool: {tc.function.name}'
+            messages.append({'role': 'tool', 'name': tc.function.name, 'content': str(result)})
+        reply = ollama.chat(model=MODEL, messages=messages, tools=TOOL_SPECS,
+                            options={'temperature': 0}).message
+
+    answer = (reply.content or '').strip()
+    history.append({'role': 'assistant', 'content': answer})
 
     # add callsign, spelled as letters so espeak does not read "eff" as e-f-f
-    response += ' KD9FMW'
+    response = answer + ' KD9FMW'
 
     mirror(f'> {response}')
 
@@ -225,13 +265,15 @@ def respond(transcribed):
     mute_until = time.time() + PLAYBACK_TAIL
 
 
-# detect voice activity blocks
-regions = auditok.split(
-    source, sw=2, ch=1, sr=16000, aw=0.5,
-    min_dur=1, max_silence=2, max_dur=100,
-    validator=SileroValidator()
-)
-for region in regions:
-    if time.time() < mute_until:
-        continue
-    transcribe(region, time.time())
+if __name__ == '__main__':
+
+    # detect voice activity blocks
+    regions = auditok.split(
+        source, sw=2, ch=1, sr=16000, aw=0.5,
+        min_dur=1, max_silence=2, max_dur=100,
+        validator=SileroValidator()
+    )
+    for region in regions:
+        if time.time() < mute_until:
+            continue
+        transcribe(region, time.time())
