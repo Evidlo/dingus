@@ -7,6 +7,7 @@ import ollama
 import requests
 import shutil
 import time
+import torch
 import traceback
 import urllib.parse
 import wave
@@ -16,7 +17,7 @@ from datetime import datetime
 from faster_whisper import WhisperModel
 from pathlib import Path
 from piper import PiperVoice, download_voices
-from silero_vad import load_silero_vad, get_speech_timestamps
+from silero_vad import load_silero_vad
 from subprocess import run
 
 
@@ -96,17 +97,30 @@ stt = WhisperModel(STT_MODEL, device='cpu', compute_type='int8')
 # a silero validator, not raw energy, decides which windows auditok keeps as speech
 vad = load_silero_vad()
 
-class SileroValidator(DataValidator):
-    def __init__(self, threshold=0.1):
-        self.threshold = threshold
+FRAME = 512  # samples silero scores at a time at 16 kHz
 
-    # reset per window so a transient can't poison silero's recurrent state
+class SileroValidator(DataValidator):
+    """Keep a window when at least `frac` of its frames score above `threshold`.
+
+    The window is peak-normalized first: capture gain is high enough that every
+    region clips, and scoring the raw level lets steady tones pass as speech.
+    Recurrent state is carried only from one accepted window to the next, so a
+    burst of tones or noise cannot suppress the speech that follows it.
+    """
+    def __init__(self, threshold=0.3, frac=0.3):
+        self.threshold = threshold
+        self.frac = frac
+        self.prev_ok = False
+
     def is_valid(self, data):
+        if not self.prev_ok:
+            vad.reset_states()
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768
-        vad.reset_states()
-        return bool(get_speech_timestamps(
-            samples, vad, sampling_rate=16000, threshold=self.threshold
-        ))
+        samples = samples / max(np.abs(samples).max(), 1e-4) * 0.9
+        frames = torch.from_numpy(samples[:len(samples) // FRAME * FRAME].reshape(-1, FRAME))
+        probs = np.array([vad(frame, 16000).item() for frame in frames])
+        self.prev_ok = bool((probs > self.threshold).sum() >= max(self.frac * len(probs), 1))
+        return self.prev_ok
 
 
 # --- transcript mirroring ---
